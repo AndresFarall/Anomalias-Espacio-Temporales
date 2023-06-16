@@ -1,0 +1,783 @@
+---
+title: "Deteccion de Anomalias en Fenomenos Espacio-Temporales"
+author: "Andres Farall"
+date: "18 de mayo de 2023"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    theme: lumen
+    toc: yes
+    toc_float: yes
+subtitle: "Una Aplicacion al Mercado Inmobiliario"
+---
+
+# Idea Basica 1:
+
+* Modelar el Precio de los Deptos con Lat+Lon suave, con features y con Barrio
+  + LM
+  + XGBoost
+* Calculo de residuos relativos
+* Analisis Espacial de Residuos Relativos: 
+  + Visualizacin
+  * No queda ningun componente espacial en los residuos
+* Deteccion de Anomalias en los lat+lon+residuos via LOF O IF
+* Analisis Espacial de las Anomalias
+  + Visualizacion
+
+# Idea Basica 2:
+
+* Deteccion de Anomalias
+* Entrenamiento predictivo de las anomalias
+* Explicabilidad de las predicciones de anomalias
+
+# Idea Basica 3:
+
+* Modelar el Precio de los Deptos sin Lat+Lon, pero con Barrio
+* Calculo de residuos relativos
+* Modelado de los Residuos Relativos con lat+lon
+
+# Idea 1
+
+# Librarias generales y espaciales
+
+```{r}
+library(tidyverse) # Manejo de Datos
+library(lubridate) # Manejo de Fechas
+library(sp) # Clases Espaciales
+library(spatstat) # spatial statistics
+library(spdep) #  procesos puntuales
+library(sf) # spatial objects: Simple FEautures
+library(terra) # spatial methods
+library("leaflet") # Mapas interactivos
+library(tmap)  # Mapping
+library(OpenStreetMap) # Mapping
+library(splines) # Smoothing
+library(dbscan) #  LOF
+library(solitude) # iForest
+library(caret) # Seleccion de Modelos
+```
+Cargamos las librerias necesarias para graficar
+
+```{r pressure,warning=FALSE, cache=FALSE, message=FALSE}
+library(readxl)
+library(ggplot2)
+library(dplyr, warn.conflicts = FALSE)
+library(tidyr)
+library(RColorBrewer)
+library(ggthemes)  # estilos de gráficos
+library(ggrepel)   # etiquetas de texto más prolijas que las de ggplot
+library(scales)    # tiene la función 'percent()'
+library(gganimate) # Para hacer gráficos animados.
+library(ggridges) # Para hacer gráficos de densidad faceteados
+library(GGally) # Para hacer varios gráficos juntos.
+library(cowplot)  #Para unir gráficos generados por ggplot2
+library(forcats)  #Para reordenar factores
+library(pyramid) # para pirámide poblacional
+library(ggcorrplot) # para correlogramas
+library(AER) # para datos
+library(hexbin) # para gráfico de dispersión con intensidad por color
+library(plotrix)
+library(ggmosaic)#mosaicos
+#library(webr)# circulares anidados
+library(kableExtra)# para tablas
+library(vioplot) # para gráficos de violín
+library(ggpubr)
+library(fmsb) #para gráfica de radar
+library(mlbench) #data sets del repositorio de  UCI 
+```
+
+# Cargo (Properati) Dataset: 12 meses de avisos: jun 2020 a jul 2021
+
+```{r}
+datos <- read.csv('/home/andresfaral/Documents/OSDE/Curso R/Ultima Clase/properati_con_outliers.csv')
+datos
+str(datos)
+```
+
+# Filtrado y manipuleo de los datos
+
+```{r}
+datos.filt <- datos %>% # agarro los datos originales
+  mutate(Pm2=price/surface_covered, # creo nuevas variables
+         Ruido=factor(ifelse(nivel_ruido_encoded<5,"Bajo",ifelse(nivel_ruido_encoded>6,"Alto","Medio")),levels=c("Bajo","Medio","Alto")),
+         start_date=ymd(start_date),                                                              end_date=ymd(end_date),
+        created_on=ymd(created_on),
+        Mom=as.numeric(start_date),
+        Momento=(Mom-min(Mom))/(max(Mom)-min(Mom)),) %>%
+  filter(price>50000, # Filtro registros
+         price<999999,
+         rooms>0,
+         bedrooms>0,
+         bathrooms>0,
+         surface_covered>20,
+         surface_covered<300,
+         lat>(-34.8),lat<(-34.5),lon>(-58.6),lon<(-58.3)) %>% 
+  select(id,lat, # Selecciono las variables con las que me quedo
+         lon,l3,start_date,end_date,
+         rooms,bathrooms,
+         bedrooms,Ruido,
+         surface_covered,
+         Pm2,
+         Momento,
+         price,min_dist_subte,min_dist_ferrocarril,min_dist_farmacia) %>%
+  rename(Barrio=l3,Lat=lat, 
+         Lon=lon, # Cambio nombres
+         Rooms=rooms,
+         Baths=bathrooms,
+         Beds=bedrooms,
+         Sup=surface_covered,
+         Com=start_date,
+         Fin=end_date,DistFarm=min_dist_farmacia,
+         Precio=price,DistTren=min_dist_ferrocarril,DistSubte=min_dist_subte) %>%
+  distinct(id,.keep_all = T) %>%  # remove duplicated ids
+  distinct(Lon,Lat,.keep_all = T) %>%  # saco deptos con misma ubicacion
+  na.omit() #%>%   # elimino faltantes
+#  sample_frac() %>% # aleatoriza las filas
+#  arrange(Pm2,Precio,Rooms) # Ordeno por precio
+# Elimino deptos de barrios poco importantes
+minimo<-100 # cantidad minima de deptos por barrio
+rareBarrio <- datos.filt %>% count(Barrio) %>% filter(n < minimo) %>% pull(Barrio)
+datos.filt <- datos.filt %>% filter(!Barrio %in% rareBarrio)
+# veamos
+datos.filt
+```
+
+# Descripcion de los Datos
+
+## Distribución de Precios de los Departamentos: Histograma y Densidad
+
+
+```{r}
+ggplot(datos.filt,aes(x=Precio,y=..density..),xlim(0,300000))+
+  geom_histogram(bins=24,color="steelblue",fill="Aquamarine4")+
+  geom_density(fill="Aquamarine3",   alpha=0.4,adjust=2)+
+  xlab("Precio") + #etiqueta del eje x
+  ylab("Frecuencia") + #etiqueta del eje y
+  ggtitle("Distribución de Precios de los Departamentos") + #título del gráfico
+  theme_minimal() # le quitamos el fondo gris y los bordes al gráfico
+```
+## Promedio de Pm2, Superficie, Cuartos, Baños y Ambientes por Barrio: Grafico de Radar
+
+```{r,collapse=TRUE}
+Valores.medios <- datos.filt %>% group_by(Barrio)  %>% select_if(.,is.numeric) %>% summarise_all(list(Media=mean,Mediana=median))
+Pm2.por.barrio <- datos.filt %>% group_by(Barrio) %>% summarise(Cant=n(),Pm2.barrio=mean(Precio/Sup)) %>% arrange(Pm2.barrio)
+Resumen <- Pm2.por.barrio %>% inner_join(Valores.medios)
+#
+Resumen.sel <- Resumen %>% select(Barrio,Sup_Media,Rooms_Media,Beds_Media,Baths_Media) %>% rename(Sup=Sup_Media,Rooms=Rooms_Media,Beds=Beds_Media,Baths=Baths_Media) %>% filter(Barrio %in% c("Almagro","Flores","Villa Lugano","Puerto Madero"))
+Resumen.sel
+rec_colors <- c("#F38181", "#FCE38A", "#85E9D3","#113366","#667744","#2299CC")
+
+ radarchart(
+   df = Resumen.sel[,-1],
+   maxmin = FALSE,  # la función calcula sola el máximo y mínimo
+   pcol=rec_colors,
+  cglty = 1,       # tipo de línea para la grilla del radar
+   cglcol = "gray", # color de línea para la grilla del radar
+plwd = 3,        # Ancho de línea para las variables
+   plty = 1,        # Tipo de línea para las variables
+ )
+legend("topleft", # posición de la leyenda
+       legend = Resumen.sel$Barrio, #nombres de la leyenda
+        bty = "o", #tipo de recuadro usado para la leyenda
+        pch = 16, #simbolos de la leyenda
+        col =rec_colors , # usar los mismos colores que en el radar 
+        text.col = "Black",
+        pt.cex = 3 #tamaño de los puntos de la figura
+)
+```
+## Distribución del Precio del Metro Cuadrado por Barrio: Ridge Plot
+
+```{r}
+require(ggridges)
+
+datos.filt %>% 
+  ggplot(aes(x=Pm2, 
+             y=fct_reorder(Barrio,Pm2), 
+             fill=Barrio))+
+  geom_density_ridges()+
+  theme(legend.position = "none")+
+  scale_x_continuous(trans="log10")+
+  labs(y="Barrio",x="Precio del Metro Cuacrado (PM2)") + xlim(500,7400)
+```
+
+## Relacion entre Superficie y Precio: Grafico Hexbin
+
+```{r}
+ggplot(datos.filt, aes(x = Sup, y = Precio)) +
+  geom_hex(bins = 50) +
+  stat_smooth(method = "gam", se = T, color="magenta")+
+  theme_bw() +
+  xlab("Superficie") + #etiqueta del eje x
+  ylab("Precio") + #etiqueta del eje y
+  ggtitle("Relacion entre Precio y Superficie")  #título
+```
+
+## Relacion entre Cantidades medias de Dormitorios y Baños, por Bario: Gráfico Scatter con Etiquetas de Texto
+
+```{r,collapse=TRUE}
+
+Resumen.sel2 <- Resumen %>% select(Barrio,Beds_Media,Baths_Media,Pm2_Media) # %>%  filter(Barrio %in% c("Almagro","Flores","Retiro","Puerto Madero"))
+
+
+ggplot(data=Resumen.sel2, aes(x = Beds_Media, y = Baths_Media)) +
+  geom_point(aes(color = Barrio,size=Pm2_Media,alpha=0.5))+ 
+  scale_size_continuous(range = c(1, 12)) +
+    geom_text(aes(label = Barrio ),
+               size = 3, vjust = 1)+
+  theme_bw() +  theme(legend.position="none") + geom_abline(intercept=0,slope=1) +
+  xlab("Dormitorios Promedio") + #etiqueta del eje x
+  ylab("Baños Promedio") + #etiqueta del eje y
+  ggtitle("Relacion entre Baños y Dormitorios por Barrio")  #título
+```
+
+## Evolución del Pm2 en el Tiempo por Barrio
+
+```{r}
+ggplot(data = datos.filt , aes(x = Com, y = Pm2,color=Barrio,fill=Barrio)) + 
+#     geom_hex(color = "#00AFBB",bins=40) + 
+  stat_smooth(
+  method = "lm",
+  se=F
+  )  +  theme(legend.position="right",legend.key.size = unit(0.2, 'cm'),legend.key.height = unit(0.5, 'cm'),legend.text = element_text(size=8)) +
+  xlab("Fecha") + #etiqueta del eje x
+  ylab("Precio del Metro Cuadrado") + #etiqueta del eje y
+  ggtitle("Evolución Temporal del Pm2 por Barrio")  #título
+```
+
+
+## Relacion entre Barrios y Cantidad de Ambientes: Grafico Heatmap
+
+```{r}
+require(gplots)
+
+datos.filt.grandes<-datos.filt 
+df<-data.frame(Barrios=as.factor(datos.filt.grandes$Barrio),Ruidos=datos.filt.grandes$Ruido,Cuartos=as.factor(datos.filt.grandes$Rooms))
+# heatmap escaldo por Cuarto
+BarriosyCuartos<-xtabs(~Cuartos+Barrios,data=df)
+heatmap.2(BarriosyCuartos,col = bluered,dendrogram = "none",,trace = "none",scale="col",cexCol = 0.6,margins=c(7,4),Rowv=NA,keysize =  1.5)
+title("Cantidad de Ambientes por Barrio")
+```
+
+# Ajuste Lineal Multiple
+
+Explico el Precio con:
+
+* Tendencia Espacial Suave
+* Tendencia Temporal Suave
+* Caracteristicas del Depto y Aviso: Cuartos, Baños, Ambientes, Superficie, Dist. al Subte y Barrio
+
+```{r}
+ajus.lineal<-lm(Precio~DistSubte+poly(Lon,3)*poly(Lat,3)+poly(Sup,2)+Momento+Baths+Beds+as.factor(Barrio),data =datos.filt)
+#
+summary(ajus.lineal)
+Pred<-predict(ajus.lineal)
+datos.filt$Pred.lm<-Pred
+# R2
+elsum<-summary(ajus.lineal)
+R2.lm<-elsum$r.squared
+# Observed Vs predicted
+ggplot(datos.filt, aes(x = Pred.lm, y = Precio)) +
+  geom_hex(bins = 30) +
+  stat_smooth(method = "gam", se = T, color="magenta")+
+  theme_bw() +
+  xlab("Precio Predicho") + #etiqueta del eje x
+  ylab("Precio Observado") + #etiqueta del eje y
+  ggtitle(paste("Precio Observado Vs. Predicho por LM - R2 =",as.character(round(R2.lm,2))))+  #título
+  geom_abline(intercept = 0,slope = 1,color="blue") 
+# PMAE
+pmae.lineal<-mean((abs(datos.filt$Precio-Pred))/datos.filt$Precio)
+pmae.lineal
+```
+
+# Prediccion con XGBoost
+
+Particion en Train - Test
+
+```{r}
+# Set train and test datasets
+set.seed(1)
+trainMN <- datos.filt %>%  
+    dplyr::sample_frac(size = .75,replace = FALSE)
+testMN <- datos.filt %>% filter(!id %in% trainMN$id)
+#
+datosMNX <- useful::build.x(Precio~DistSubte+Lon+Lat+Sup+Momento+Baths+Beds+as.factor(Barrio) - 1, datos.filt, contrasts = FALSE)
+trainMNX <- useful::build.x(Precio~DistSubte+Lon+Lat+Sup+Momento+Baths+Beds+as.factor(Barrio) - 1, trainMN, contrasts = FALSE)
+trainMNY <- useful::build.y(Precio~DistSubte+Lon+Lat+Sup+Momento+Baths+Beds+as.factor(Barrio) - 1, trainMN)
+testMNX <- useful::build.x(Precio~DistSubte+Lon+Lat+Sup+Momento+Baths+Beds+as.factor(Barrio) - 1, testMN, contrasts = FALSE)
+testMNY <- useful::build.y(Precio~DistSubte+Lon+Lat+Sup+Momento+Baths+Beds+as.factor(Barrio) - 1, testMN)
+dim(datosMNX)
+dim(trainMNX)
+dim(testMNX)
+```   
+
+Entrenamiento con XGBoost
+
+```{r}
+grid_default <- expand.grid(
+  nrounds = 150,
+  max_depth = 6,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+train_control <- caret::trainControl(
+  method = "none",
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE 
+)
+
+xgb_base <- caret::train(
+  x = trainMNX,
+  y = trainMNY,
+  trControl = train_control,
+  tuneGrid = grid_default,
+  method = "xgbTree",
+  verbose = TRUE,
+  nthreads = 4
+)
+#
+basePred <- predict(xgb_base,testMNX)
+baseRMSE <- caret::RMSE(basePred, testMNY)
+baseRMSE
+# Calculo de predichos
+datos.filt$Pred<-predict(xgb_base,datosMNX)
+# R2
+sstot<-sum((testMN$Precio-mean(testMN$Precio))**2)
+ssres<-sum((testMN$Precio-basePred)**2)
+R2.xgb<-1-(ssres)/(sstot)
+R2.xgb
+# Observed Vs predicted
+ggplot(datos.filt, aes(x = Pred, y = Precio)) +
+  geom_hex(bins = 30) +
+  stat_smooth(method = "gam", se = T, color="magenta")+
+  theme_bw() +
+  xlab("Precio Predicho") + #etiqueta del eje x
+  ylab("Precio Observado") + #etiqueta del eje y
+  ggtitle(paste("Precio Observado Vs. Predicho por XGBoost - R2 =",as.character(round(R2.xgb,2))))+  #título
+  geom_abline(intercept = 0,slope = 1,color="blue")
+
+# PMAE
+pmae.xgb<-mean((abs(testMN$Precio-basePred))/testMN$Precio)
+pmae.xgb
+# Importancia de las variables
+importancia<-varImp(xgb_base)
+plot(importancia,10,main="Importancia de Variables de XGBoost")
+```
+
+
+# Calculo de Residuos Absolutos y Relativos (con XGBoost)
+
+```{r}
+# Calculo de Residuos: Obs - Pred
+datos.filt$Res<-datos.filt$Precio-datos.filt$Pred
+# Calculo de Residuos Relativos: (Obs - Pred) / Obs
+datos.filt$ResidRel<-datos.filt$Res/datos.filt$Precio
+# Residuos relativos topeados
+tope<-0.0025 # 
+qbajo<-quantile(datos.filt$ResidRel,tope)
+qalto<-quantile(datos.filt$ResidRel,1-tope)
+resrel.mod<-datos.filt$ResidRel
+resrel.mod[resrel.mod<qbajo]<-qbajo
+resrel.mod[resrel.mod>qalto]<-qalto
+datos.filt$ResidRelTop<-resrel.mod
+# Residuos Topeados Balanceados: Equiparo los rangos positivos y negativos
+resrel.min<-abs(min(datos.filt$ResidRelTop))
+resrel.max<-max(datos.filt$ResidRelTop)
+resrel.bal<-ifelse(datos.filt$ResidRelTop<=0,datos.filt$ResidRelTop/resrel.min,datos.filt$ResidRelTop/resrel.max)
+datos.filt$ResidRelBal<-resrel.bal
+
+# Visualizacion Residuos Relativos y Topeados
+# Comparacion de Residuos
+ggplot(datos.filt)+
+  geom_histogram(aes(x=ResidRelTop,y=..density..),bins=90,color="steelblue",fill="Aquamarine4")+
+  geom_density(aes(x=ResidRel,y=..density..),fill="Aquamarine3",color="red",   alpha=0.4,adjust=2) + xlim(-1,1) +
+  xlab("Residuo Relativos") + #etiqueta del eje x
+  ylab("Frecuencia") + #etiqueta del eje y
+  ggtitle("Distribución de los Residuos Relativos")  #título del gráfico
+
+# Visualizacion Residuos Balanceados
+ggplot(datos.filt)+
+  geom_histogram(aes(x=ResidRelBal,y=..density..),bins=90,color="steelblue",fill="Aquamarine4")+
+  geom_density(aes(x=ResidRel,y=..density..),fill="Aquamarine3",color="red",   alpha=0.4,adjust=2) + xlim(-1,1) +
+  xlab("Residuo Relativos") + #etiqueta del eje x
+  ylab("Frecuencia") + #etiqueta del eje y
+  ggtitle("Distribución de los Residuos Balanceados") #título del gráfico
+
+# Ordeno residyuos relativos
+  coord_cartesian(xlim=c(-1,1))
+orden<-order(datos.filt$ResidRel)
+cuantos<-100
+# los residyuos relativos mas bajos
+datos.filt %>% slice(orden[1:cuantos]) %>% select(Precio,Pred,Pred.lm,Sup,Pm2,Rooms,Baths,Beds,Barrio)
+# los residyuos relativos mas altos
+datos.filt %>% slice(rev(orden)[1:cuantos]) %>% select(Precio,Pred,Pred.lm,Sup,Pm2,Rooms,Baths,Beds,Barrio)
+```
+
+
+# Quedan tendencias espaciales en los Residuos Relativos ?
+
+## Optimo por CV
+
+```{r}
+require(boot)
+grados<-10
+deltas <- rep(NA, grados)
+for (i in 1:grados) 
+  {
+  #i<-3
+fit <- glm(ResidRel~poly(Lon,i)*poly(Lat,i),data=datos.filt)
+  deltas[i] <- boot::cv.glm(datos.filt, fit, K = 10)$delta[1]
+}
+
+Ajus.Esp.df<-data.frame(Df=(1:grados),Error=deltas)
+# Visualizacion
+ggplot(Ajus.Esp.df, aes(x=Df,y=Error)) + geom_line() +
+xlab("Grados de Libertad") + #etiqueta del eje x
+ylab("Error por CV") + #etiqueta del eje y
+ggtitle("Estructura Espacial de los Resoduos")  #título
+# Modelo Optimo
+ajus.lm.tend<-lm(ResidRelTop~poly(Lon,6)*poly(Lat,6),data=datos.filt)
+#ajus.lm.tend<-lm(ResidRelTop~bs(Lon,df=6)*bs(Lat,df=6),data=datos.filt)
+summary(ajus.lm.tend)
+```
+
+
+# Analisis Espacial de los Resoduos Relativos y Detección de Anomalias
+
+De ahora en mas se trabaja con clases espaciales:
+
+* Cargamos limites de CABA
+* Creacion de un SPDF
+* Creacion de un sf
+* creacion de un ppp
+
+# Cargo Limites de CABA
+
+```{r}
+# Load CABA borders
+provincia.comp <- st_read("/home/andresfaral/Documents/Estadistica Espacial/Provincia/")
+caba.ch<-st_convex_hull(provincia.comp[1,]$geometry)
+#plot(caba.ch)
+coo<-st_coordinates(caba.ch)[-35,1:2]
+caba.win<-owin(poly=list(x=rev(coo[,1]),y=rev(coo[,2])))
+#plot(caba.win)
+
+```
+
+
+# Conversion a sf
+
+```{r}
+datos.sf <- datos.filt %>% st_as_sf(coords = c("Lon", "Lat"), crs = 4326)
+distancias<-st_distance(datos.sf,caba.ch)
+quedan<-(as.numeric(distancias)==0)
+sum(quedan)
+datos.sf<-datos.sf[quedan,]
+datos.sf
+```
+
+Reescribo datos.filt sacando una obs que quedó afuera de CABA
+
+```{r}
+datos.filt<-datos.filt[quedan,]
+datos.filt
+```
+
+
+
+Conversion a ppp con Limites de CABA
+
+```{r}
+# Conversion a ppp
+datos.ppp <- as.ppp(st_coordinates(datos.sf), caba.win)
+marks(datos.ppp)
+window(datos.ppp)
+# Adding marks
+marks(datos.ppp)<-as.factor(datos.sf$ResidRel>0)
+```
+
+
+## Dependencia entre posicion y Residuos ? O sea, dependencia entre Puntos y Marcas
+
+```{r}
+require(gstat)
+datos.ppp.res<-datos.ppp
+# Adding marks
+marks(datos.ppp.res)<-datos.sf$ResidRelTop
+plot(datos.ppp.res)
+# Conversion a SPDF
+datos.ppp.res.df<-as.data.frame(datos.ppp.res)
+datos.ppp.res.spdf<-datos.ppp.res.df
+coordinates(datos.ppp.res.spdf) <- c("x", "y") # como spatialpoints dataframe
+# Grafico
+spplot(datos.ppp.res.spdf, colorkey = TRUE)
+### Vaiograma
+#hscat(marks ~ 1, datos.ppp.res.spdf, seq(0,0.1,length.out = 11))
+variog<-variogram(marks ~ 1, datos.ppp.res.spdf)
+plot(variog,type="l",main="Variograma de Residuos Relativos",lwd=3)
+
+```
+
+
+## Visualization en Mapa de los Residuos Balanceados
+Usando objeto sf
+
+```{r}
+# Paleta de colores
+pal <- colorNumeric(palette = "RdBu", domain = c(min(datos.sf$ResidRelBal),max(datos.sf$ResidRelBal)))
+# descriptive character field
+datos.sf$Desc<-paste("Barrio",datos.filt$Barrio,"Sup",datos.filt$Sup,"Beds",datos.filt$Beds,"Baths",datos.filt$Baths,"<br>Precio",as.character(datos.filt$Precio),"Pred",as.character(round(datos.filt$Pred,2)),"ResRel",as.character(round(datos.filt$ResidRel,2)))
+
+# Mapa
+leaflet(datos.sf) %>% addTiles() %>% addCircleMarkers(fillOpacity = 0.5,weight=1,radius=~abs(ResidRelBal*20),color = ~pal(ResidRelBal),popup = ~Desc,label=~paste("Resid",as.character(round(ResidRel,2))))
+```
+
+
+
+# Bump Hunting with PRIM
+
+```{r}
+require(prim)
+x.data<-datos.filt[,c("Lon","Lat")]
+y.data<-datos.filt[,c("ResidRelTop")]
+#Resid.prim <- prim.box(x=x.data,y=y.data, threshold.type=1)
+# Busco ResidRel positivos (sobre-valuados)
+#Resid.prim <- prim.box(x=x.data, y=y.data, peel.alpha = 0.05, mass.min = 0.0005, threshold.type=1)
+# Busco ResidRel negativos (sub-valuados)
+Resid.prim <- prim.box(x=x.data, y=y.data, peel.alpha = 0.05, mass.min = 0.0005, threshold.type=-1)
+
+# Grfico de valores de la funcion
+#summary(Resid.prim, print.box=TRUE)
+plot(unlist(Resid.prim$y.fun))
+
+```
+
+## Visualizacion de Cajas
+
+```{r}
+# ordebo cajas por valores de funcion - SUB-valuados
+orden<-order(unlist(Resid.prim$y.fun))
+# ordebo cajas por valores de funcion - SoBre-valuados
+#orden<-rev(order(unlist(Resid.prim$y.fun)))
+
+# Gusrdo los primeros
+cant.cajas<-10
+Valores<-Resid.prim$y.fun[orden[1:cant.cajas]]
+Cantidades<-Resid.prim$mass[orden[1:cant.cajas]]
+Cajas<-Resid.prim$box[orden[1:cant.cajas]]
+
+# Armo los poligonos de las cajas elegidas
+i<-1
+caja.eleg<-Cajas[[i]]
+lon = caja.eleg[,1]
+lat = caja.eleg[,2]
+
+Poly_Coord_df = data.frame(lon, lat)
+
+pol = st_polygon(     list(
+       cbind(
+         Poly_Coord_df$lon[c(1,2,2,1,1)], 
+         Poly_Coord_df$lat[c(1,1,2,2,1)])
+       ))
+polc = st_sfc(pol, crs=4326)
+polc.todos<-polc
+
+for (i in 2:cant.cajas)
+{
+caja.eleg<-Cajas[[i]]
+lon = caja.eleg[,1]
+lat = caja.eleg[,2]
+
+Poly_Coord_df = data.frame(lon, lat)
+
+pol = st_polygon(     list(
+       cbind(
+         Poly_Coord_df$lon[c(1,2,2,1,1)], 
+         Poly_Coord_df$lat[c(1,1,2,2,1)])
+       ))
+polc = st_sfc(pol, crs=4326)
+polc.todos<-c(polc.todos,polc)
+  
+}
+polc.todos
+#poly <- Poly_Coord_df %>% 
+#  st_as_sf(coords = c("lon", "lat"), 
+#           crs = 4326) %>% 
+#  st_bbox() %>% 
+#  st_as_sfc()
+# muestro la caja
+#leaflet(datos.out.sf) %>% addTiles() %>% addCircleMarkers(radius = 0.1) %>% addPolygons(data=polc,color = "red")
+##
+# Paleta de colores
+pal <- colorNumeric(palette = "RdBu", domain = c(min(datos.sf$ResidRelBal),max(datos.sf$ResidRelBal)))
+# descriptive character field
+datos.sf$Desc<-paste("Barrio",datos.filt$Barrio,"Sup",datos.filt$Sup,"Beds",datos.filt$Beds,"Baths",datos.filt$Baths,"<br>Precio",as.character(datos.filt$Precio),"Pred",as.character(round(datos.filt$Pred,2)),"ResRel",as.character(round(datos.filt$ResidRel,2)))
+
+# Mapa
+leaflet(datos.sf) %>% addTiles() %>% addPolygons(data=polc.todos,fillColor = "transparent",opacity = 1,weight = 2,color = "black") %>% addCircleMarkers(fillOpacity = 0.2,weight=0.1,radius=~abs(ResidRelBal*10),color = ~pal(ResidRelBal),popup = ~Desc,label=~paste("Resid",as.character(round(ResidRel,2)))) 
+```
+
+
+Relative Risk Analysis
+Overpriced Vs Underpriced
+
+```{r}
+plot(datos.ppp,cex=0.3,color=2:3)
+# Intensity model
+ajus.RR<-ppm(datos.ppp~marks*bs(x,df=5)*bs(y,df=5),Poisson())
+ajus.RR
+#plot(ajus4,pause=FALSE,superimpose = FALSE)
+pred.RR<-predict(ajus.RR)
+plot(pred.RR)
+
+```
+
+Calculo del Riesgo RElativo
+
+```{r}
+# por separado
+#CaroVsBarato<-relrisk(datos.ppp)
+#CaroVsBarato
+#plot(CaroVsBarato)
+# Relativo
+#CaroVsBarato.rel<-relrisk(datos.ppp,relative = TRUE)
+#CaroVsBarato.rel
+#plot(CaroVsBarato.rel)
+# fijando el sigma
+CaroVsBarato.sig<-relrisk(datos.ppp,sigma = 0.003)
+plot(CaroVsBarato.sig)
+```
+Spatial Autocorrelation: THERE IS NO AUTOCORRELATION !!!!
+
+```{r}
+set.seed(1) # setting the seed
+coo1<-st_coordinates(datos.sf)
+cuales<-sample(1:nrow(coo1),5000) # sample of points
+coo2<-coo1[cuales,]
+# Distance computation
+distan<-(dist(coo2))^1
+hist(distan,300)
+# Weights calculation: 0-1
+w <- 1/as.matrix(distan)
+umbral<-0.005
+w[distan<umbral]<-1
+diag(w) <- 0
+w[distan>=umbral]<-0
+table(w)
+barplot(table(apply(w,1,sum)))
+#sum(w==Inf)
+#w[w==Inf]<-0
+#rev(sort(as.numeric(w)))[1:100]
+#hist(as.numeric(w),50)
+#tope<-quantile(as.numeric(w),0.99)
+#w[w>tope]<-tope
+#summary(as.numeric(w))
+
+eltest<-moran.test(datos.sf$ResidRel[cuales],mat2listw(w),randomisation = TRUE)
+round(eltest$estimate,4)
+(eltest$estimate[1]-eltest$estimate[2])/sqrt(eltest$estimate[3])
+eltest
+# Noran Scatter Plot
+moran.plot(datos.sf$ResidRel[cuales],mat2listw(w))
+```
+
+# Deteccion de Anomalias en abase a los Residuos Relativos
+
+## Usando Local Outlier Factor (LOF)
+
+```{r}
+# Usando Residuos Topeados y Balanceados
+datos.res<-datos.filt %>% select(Lon,Lat,ResidRelBal)
+lof.sco<-lof(datos.res,k=11)
+summary(lof.sco)
+plot(lof.sco)
+datos.filt %>% filter(lof.sco>2)
+```
+
+## Visualizacion de Anomalias de LOF
+
+Color proporcional a los Residuos Topeados Balanceados
+Tamaño del punto con umbral dependiente del Score 
+
+```{r}
+# agrego el score a la base
+datos.filt$Lof.Sco<-lof.sco
+# descriptive character field
+datos.filt$Desc<-paste("Barrio",datos.filt$Barrio,"Sup",datos.filt$Sup,"Beds",datos.filt$Beds,"Baths",datos.filt$Baths,"<br>Precio",as.character(datos.filt$Precio),"Pred",as.character(round(datos.filt$Pred,2)),"ResRel",as.character(round(datos.filt$ResidRel,2)))
+#
+datos.out.sf <- datos.filt %>% st_as_sf(coords = c("Lon", "Lat"), crs = 4326)
+umbral.lof<-0.990 # umbral en terminos de percentiles
+pal <- colorNumeric(palette = "RdBu", domain = datos.filt$ResidRelBal)
+limite<-quantile(datos.filt$Lof.Sco,umbral.lof)
+reescala<-function(x){ifelse(x<limite,x*5,x*20)}
+# Color proporcional a los Residuos Topeados Balanceados
+# Tamaño con umbral por factor
+leaflet(datos.out.sf) %>% addTiles() %>% addCircleMarkers(fillOpacity = 0.5,weight=1,radius=~reescala(Lof.Sco),color = ~pal(ResidRelBal),popup = ~Desc,label=~paste("Score",as.character(round(Lof.Sco,2))))
+
+```
+
+
+## Usando iForests (IF)
+
+```{r}
+datos.filt.iforests<-datos.res 
+# Modelo isolation forest
+isoforest <- isolationForest$new(
+                sample_size = as.integer(nrow(datos.filt.iforests)/1), # cant de obs muestreadas en cada arbol
+                num_trees   = 300, # cant de arboles
+                replace     = FALSE, # con reemplazo ?
+                respect_unordered_factors = NULL,
+                max_depth = 24, # profundidad maxima de cada arbol
+                seed        = 123 # semilla
+             )
+# Entrenamiento
+isoforest$fit(dataset = datos.filt.iforests)
+predicciones <- isoforest$predict(data = datos.filt.iforests)
+hist(predicciones$average_depth,50)
+hist(predicciones$anomaly_score,50)
+#
+#escores<-scale(predicciones$anomaly_score)
+ifo.sco<-predicciones$anomaly_score
+peores<-rev(order(ifo.sco))
+mejores<-(order(ifo.sco))
+# Veo los peores
+datos.filt[peores[1:50],]
+
+# Grafico de Scores
+plot(ifo.sco)
+plot(datos.filt$ResidRelTop,ifo.sco)
+```
+
+Visualizacion de Anomalias de IForest
+
+```{r}
+# adding outliers scores to data
+datos.filt$Ifo.Sco<-ifo.sco
+# descriptive character field
+datos.filt$Desc<-paste("Barrio",datos.filt$Barrio,"Sup",datos.filt$Sup,"Beds",datos.filt$Beds,"Baths",datos.filt$Baths,"<br>Precio",as.character(datos.filt$Precio),"Pred",as.character(round(datos.filt$Pred,2)),"ResRel",as.character(round(datos.filt$ResidRel,2)))
+#
+datos.out.sf <- datos.filt %>% st_as_sf(coords = c("Lon", "Lat"), crs = 4326)
+# with leaflet
+pal <- colorNumeric(palette = "RdBu", domain = datos.filt$ResidRelBal)
+umbral.ifo<-0.990
+limite<-quantile(datos.filt$Ifo.Sco,umbral.ifo)
+reescala<-function(x){ifelse(x<limite,x*10,x*40)}
+#reescala<-function(x){ifelse(x<0.55,x*1,x*20)}
+
+#
+leaflet(datos.out.sf) %>% addTiles() %>% addCircleMarkers(fillOpacity = 0.5,weight=1,radius=~reescala(Ifo.Sco),color = ~pal(ResidRelBal),popup = ~Desc,label=~paste("Score",as.character(round(ifo.sco,2))))
+
+```
+
+# Mapa de Deptos
+
+```{r}
+leaflet(datos.out.sf) %>% addTiles() %>% addCircleMarkers(fillOpacity = 0.1,weight=1,radius=0.5,color = "blue")
+
+```
+
